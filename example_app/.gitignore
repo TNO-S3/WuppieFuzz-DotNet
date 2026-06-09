@@ -1,0 +1,20 @@
+# Build results
+bin/
+obj/
+*.dll
+*.exe
+*.so
+*.dylib
+*.o
+
+# User-specific files
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+*.userprefs
+
+# Rider
+.idea/
+*.sln.iml

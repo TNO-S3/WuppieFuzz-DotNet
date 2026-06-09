@@ -1,0 +1,429 @@
+openapi: 3.0.0
+info:
+  title: Pet Store API
+  version: v1
+  description: A simple pet store API for testing and fuzzing
+  contact:
+    name: WuppieFuzz Example
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:5000
+    description: Local development server
+  - url: http://localhost:8080
+    description: Alternative port
+
+paths:
+  /health:
+    get:
+      summary: Health check endpoint
+      operationId: getHealth
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+              examples:
+                success:
+                  value:
+                    status: ok
+
+  /pet:
+    get:
+      summary: Get list of all pet IDs
+      operationId: getPetIds
+      tags:
+        - Pet
+      responses:
+        '200':
+          description: List of pet IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  petIds:
+                    type: array
+                    items:
+                      type: integer
+                      format: int64
+                    example: [1, 2, 3]
+              examples:
+                success:
+                  value:
+                    petIds: [1, 2, 3]
+                empty:
+                  value:
+                    petIds: []
+
+    post:
+      summary: Create a new pet
+      operationId: createPet
+      tags:
+        - Pet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePetRequest'
+            examples:
+              dog:
+                value:
+                  name: Buddy
+                  type: dog
+                  age: 3
+                  description: A friendly golden retriever
+              cat:
+                value:
+                  name: Whiskers
+                  type: cat
+                  age: 2
+      responses:
+        '201':
+          description: Pet created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+              examples:
+                success:
+                  value:
+                    id: 3
+                    name: Buddy
+                    type: dog
+                    age: 3
+                    status: available
+                    description: A friendly golden retriever
+        '400':
+          description: Invalid request - missing required fields
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Name and Type are required
+              examples:
+                missingFields:
+                  value:
+                    error: Name and Type are required
+
+  /pet/{id}:
+    get:
+      summary: Get pet details by ID
+      operationId: getPetById
+      tags:
+        - Pet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Pet ID
+          schema:
+            type: integer
+            format: int64
+            example: 1
+      responses:
+        '200':
+          description: Pet found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+              examples:
+                success:
+                  value:
+                    id: 1
+                    name: Fluffy
+                    type: cat
+                    age: 3
+                    status: available
+                    description: null
+        '404':
+          description: Pet not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Pet with ID 999 not found
+
+    put:
+      summary: Update pet (full replacement)
+      operationId: updatePetFull
+      tags:
+        - Pet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Pet ID
+          schema:
+            type: integer
+            format: int64
+            example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePetRequest'
+            examples:
+              replace:
+                value:
+                  name: Fluffy Updated
+                  type: cat
+                  age: 4
+                  status: adopted
+      responses:
+        '200':
+          description: Pet updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+              examples:
+                success:
+                  value:
+                    id: 1
+                    name: Fluffy Updated
+                    type: cat
+                    age: 4
+                    status: adopted
+                    description: null
+        '400':
+          description: Invalid request - missing required fields for full replacement
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Name and Type are required for full replacement
+        '404':
+          description: Pet not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Pet with ID 999 not found
+
+    patch:
+      summary: Partially update pet (partial updates allowed)
+      operationId: updatePetPartial
+      tags:
+        - Pet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Pet ID
+          schema:
+            type: integer
+            format: int64
+            example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePetRequest'
+            examples:
+              updateName:
+                value:
+                  name: Fluffy Jr
+              updateStatus:
+                value:
+                  status: pending
+              updateMultiple:
+                value:
+                  age: 5
+                  status: adopted
+      responses:
+        '200':
+          description: Pet updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+              examples:
+                success:
+                  value:
+                    id: 1
+                    name: Fluffy Jr
+                    type: cat
+                    age: 5
+                    status: adopted
+                    description: null
+        '404':
+          description: Pet not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Pet with ID 999 not found
+
+    delete:
+      summary: Delete a pet by ID
+      operationId: deletePet
+      tags:
+        - Pet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Pet ID
+          schema:
+            type: integer
+            format: int64
+            example: 1
+      responses:
+        '204':
+          description: Pet deleted successfully (no content)
+        '404':
+          description: Pet not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: Pet with ID 999 not found
+
+components:
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+        - type
+        - status
+        - age
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Unique identifier for the pet
+          example: 1
+        name:
+          type: string
+          description: The name of the pet
+          minLength: 1
+          maxLength: 256
+          example: Fluffy
+        type:
+          type: string
+          description: The type of animal (e.g., dog, cat)
+          minLength: 1
+          maxLength: 256
+          example: cat
+        status:
+          type: string
+          description: Current status of the pet
+          enum: [available, adopted, pending]
+          example: available
+        age:
+          type: integer
+          description: Age of the pet in years
+          minimum: 0
+          maximum: 100
+          example: 3
+        description:
+          type: string
+          nullable: true
+          description: Optional description or notes about the pet
+          maxLength: 1024
+          example: A friendly and affectionate cat
+
+    CreatePetRequest:
+      type: object
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: The name of the pet
+          minLength: 1
+          maxLength: 256
+          example: Buddy
+        type:
+          type: string
+          description: The type of animal (e.g., dog, cat)
+          minLength: 1
+          maxLength: 256
+          example: dog
+        age:
+          type: integer
+          description: Age of the pet in years
+          minimum: 0
+          maximum: 100
+          example: 5
+        description:
+          type: string
+          nullable: true
+          description: Optional description or notes about the pet
+          maxLength: 1024
+          example: A friendly golden retriever
+
+    UpdatePetRequest:
+      type: object
+      description: Partial update request - all fields are optional
+      properties:
+        name:
+          type: string
+          description: Updated name of the pet
+          minLength: 1
+          maxLength: 256
+          example: Buddy Updated
+        type:
+          type: string
+          description: Updated type of animal
+          minLength: 1
+          maxLength: 256
+          example: dog
+        status:
+          type: string
+          description: Updated status of the pet
+          enum: [available, adopted, pending]
+          example: adopted
+        age:
+          type: integer
+          description: Updated age in years
+          minimum: 0
+          maximum: 100
+          example: 6
+        description:
+          type: string
+          nullable: true
+          description: Updated description or notes
+          maxLength: 1024
+          example: A friendly and loyal companion
+
+tags:
+  - name: Health
+    description: Health check endpoints
+  - name: Pet
+    description: Pet management endpoints
