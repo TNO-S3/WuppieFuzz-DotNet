@@ -197,6 +197,7 @@ while (true)
 WaitForAccumulationQueueDrained();
 accumulateQueue.CompleteAdding();
 accumulatorThread.Join(5000);
+SnapshotClient.DisposeAll();
 try { RunProcess("dotnet-coverage", $"shutdown {sessionId}"); } catch { }
 collectProc.WaitForExit(5000);
 Console.WriteLine("Agent stopped.");
@@ -217,9 +218,14 @@ static string GetCoverageXml(string sessionId, string tempDir, bool reset, Actio
     bool handedOff = false;
     try
     {
-        string resetFlag = reset ? "--reset" : "";
-        int rc = RunProcess("dotnet-coverage", $"snapshot {sessionId} {resetFlag} -o \"{snapFile}\"");
-        if (rc != 0 || !File.Exists(snapFile))
+        bool snapped = SnapshotClient.TrySnapshot(sessionId, snapFile, reset);
+        if (!snapped)
+        {
+            string resetFlag = reset ? "--reset" : "";
+            int rc = RunProcess("dotnet-coverage", $"snapshot {sessionId} {resetFlag} -o \"{snapFile}\"");
+            snapped = rc == 0 && File.Exists(snapFile);
+        }
+        if (!snapped)
         {
             Console.Error.WriteLine("dotnet-coverage snapshot returned no output");
             return "<coverage version=\"1\"><packages/></coverage>";
@@ -310,7 +316,8 @@ static byte[]? GenerateReport(string sessionId, string tempDir)
         if (!File.Exists(accFile))
         {
             string snapFile = Path.Combine(tempDir, $"final-{Guid.NewGuid():N}.coverage");
-            RunProcess("dotnet-coverage", $"snapshot {sessionId} -o \"{snapFile}\"");
+            if (!SnapshotClient.TrySnapshot(sessionId, snapFile, reset: false))
+                RunProcess("dotnet-coverage", $"snapshot {sessionId} -o \"{snapFile}\"");
             if (File.Exists(snapFile))
                 File.Move(snapFile, accFile, overwrite: true);
             else
@@ -504,14 +511,23 @@ static class CoverageMerger
     /// Locates Microsoft.CodeCoverage.Core.dll inside the currently
     /// installed `dotnet-coverage` global tool's store directory:
     /// ~/.dotnet/tools/.store/dotnet-coverage/&lt;version&gt;/dotnet-coverage/&lt;version&gt;/tools/&lt;tfm&gt;/any/Microsoft.CodeCoverage.Core.dll
-    private static string? FindCoreDll()
+    private static string? FindCoreDll() => DotnetCoverageToolFiles.Find("Microsoft.CodeCoverage.Core.dll");
+}
+
+/// Shared helper for locating DLLs inside the installed `dotnet-coverage`
+/// global tool's `.store` directory, used by both <see cref="CoverageMerger"/>
+/// and <see cref="SnapshotClient"/> to find their respective in-process
+/// reflection targets without adding separate NuGet package references.
+static class DotnetCoverageToolFiles
+{
+    public static string? Find(string fileName)
     {
         string toolsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools");
         string storeDir = Path.Combine(toolsDir, ".store", "dotnet-coverage");
         if (!Directory.Exists(storeDir)) return null;
 
-        return Directory.GetFiles(storeDir, "Microsoft.CodeCoverage.Core.dll", SearchOption.AllDirectories)
+        return Directory.GetFiles(storeDir, fileName, SearchOption.AllDirectories)
             .OrderByDescending(f => f) // prefer the lexicographically-highest (newest) version path
             .FirstOrDefault();
     }
@@ -540,5 +556,169 @@ sealed class IsolatedCoverageCoreLoadContext : AssemblyLoadContext
     {
         string candidate = Path.Combine(baseDir, assemblyName.Name + ".dll");
         return File.Exists(candidate) ? LoadFromAssemblyPath(candidate) : null;
+    }
+}
+
+/// Takes coverage snapshots in-process via the same named-pipe IPC call that
+/// the `dotnet-coverage snapshot` CLI command uses internally
+/// (`LoggerClient.SendSnapshotMessage`), instead of spawning a subprocess.
+///
+/// Rationale: measurements in this environment showed `dotnet-coverage
+/// snapshot` (as a CLI subprocess) costs ~160-280ms per call almost entirely
+/// due to fixed CLI bootstrap cost (DI graph construction, Serilog setup,
+/// System.CommandLine parsing) -- even an invocation that does no real work
+/// (e.g. a bad-argument error path) takes about the same time. The actual
+/// named-pipe round-trip, once a `LoggerClient` is connected, measured at
+/// ~1-4ms per call (with a one-time ~60ms pipe-connect cost for the first
+/// call on a session). This routine reuses one connected `LoggerClient` per
+/// session across calls to amortize that connect cost.
+///
+/// WARNING - higher risk than <see cref="CoverageMerger"/>: every type used
+/// here (`LoggerClient`, `LoggerClientFactory`, `PlatformEnvironment`,
+/// `PipeHelper`, ...) is `internal` to Microsoft.CodeCoverage's assemblies,
+/// spread across three separate DLLs (`Microsoft.CodeCoverage.Interprocess.dll`,
+/// `Microsoft.CodeCoverage.Core.dll`,
+/// `Microsoft.CodeCoverage.Instrumentation.Core.dll`). None of this is
+/// public/documented/versioned API -- unlike `CoverageFileUtilityV2`, it has
+/// no support contract at all and could be renamed or restructured in any
+/// `dotnet-coverage` release without notice. Every step is defensive: if any
+/// type/member lookup fails, or any call throws, the affected session falls
+/// back to spawning `dotnet-coverage snapshot` as a subprocess (slower, but
+/// always correct), and this class permanently disables itself (does not
+/// keep retrying the broken reflection path on every future call).
+static class SnapshotClient
+{
+    private static readonly object InitLock = new();
+    private static bool initFailed;
+    private static object? environment;
+    private static object? loggerClientFactory;
+    private static MethodInfo? createLoggerClientMethod;
+    private static MethodInfo? sendSnapshotMethod;
+
+    private static readonly ConcurrentDictionary<string, object> loggerClients = new();
+
+    /// Attempts an in-process snapshot. Returns true if the output file was
+    /// written successfully; false if in-process invocation is unavailable
+    /// or failed (caller should fall back to the CLI subprocess for this call).
+    public static bool TrySnapshot(string sessionId, string outputPath, bool reset, string tagId = "", string tagName = "")
+    {
+        if (!EnsureInitialized()) return false;
+
+        object? client = null;
+        try
+        {
+            client = loggerClients.GetOrAdd(sessionId, id =>
+                createLoggerClientMethod!.Invoke(loggerClientFactory, new object[] { id, NullLoggerInstance!, 30_000 })!);
+
+            sendSnapshotMethod!.Invoke(client, new object[] { outputPath, reset, tagId, tagName });
+            return File.Exists(outputPath);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"In-process coverage snapshot failed ({ex.Message}); falling back to subprocess for this call");
+            // The cached client may be wrapping a broken/disconnected pipe (e.g. the
+            // `dotnet-coverage collect --server-mode` process restarted); evict it so
+            // the next call builds a fresh one instead of repeatedly failing.
+            if (client is not null && loggerClients.TryRemove(sessionId, out _))
+                (client as IDisposable)?.Dispose();
+            return false;
+        }
+    }
+
+    private static object? NullLoggerInstance;
+
+    private static bool EnsureInitialized()
+    {
+        if (sendSnapshotMethod is not null) return true;
+        if (initFailed) return false;
+        lock (InitLock)
+        {
+            if (sendSnapshotMethod is not null) return true;
+            if (initFailed) return false;
+            try
+            {
+                string? corePath = DotnetCoverageToolFiles.Find("Microsoft.CodeCoverage.Core.dll");
+                string? ipcPath = DotnetCoverageToolFiles.Find("Microsoft.CodeCoverage.Interprocess.dll");
+                string? instPath = DotnetCoverageToolFiles.Find("Microsoft.CodeCoverage.Instrumentation.Core.dll");
+                if (corePath is null || ipcPath is null || instPath is null)
+                {
+                    Console.Error.WriteLine(
+                        "Microsoft.CodeCoverage.{Core,Interprocess,Instrumentation.Core}.dll not all found; " +
+                        "snapshot operations will use the dotnet-coverage CLI subprocess instead (slower)");
+                    initFailed = true;
+                    return false;
+                }
+
+                var loadContext = new IsolatedCoverageCoreLoadContext(corePath);
+                Assembly core = loadContext.LoadFromAssemblyPath(corePath);
+                Assembly ipc = loadContext.LoadFromAssemblyPath(ipcPath);
+                Assembly inst = loadContext.LoadFromAssemblyPath(instPath);
+
+                Type fileHelperType = core.GetType("Microsoft.CodeCoverage.Core.Utils.FileHelper")
+                    ?? throw new InvalidOperationException("FileHelper type not found");
+                Type runtimeInfoHelperType = core.GetType("Microsoft.CodeCoverage.Core.Utils.RuntimeInformationHelper")
+                    ?? throw new InvalidOperationException("RuntimeInformationHelper type not found");
+                Type envType = core.GetType("Microsoft.CodeCoverage.Core.PlatformEnvironment")
+                    ?? throw new InvalidOperationException("PlatformEnvironment type not found");
+                Type envIfaceType = core.GetType("Microsoft.CodeCoverage.Core.IEnvironment")
+                    ?? throw new InvalidOperationException("IEnvironment type not found");
+                Type nullLoggerType = core.GetType("Microsoft.CodeCoverage.Core.Logger.NullLogger")
+                    ?? throw new InvalidOperationException("NullLogger type not found");
+                Type pipeHelperType = inst.GetType("Microsoft.CodeCoverage.Instrumentation.Core.Tracker.PipeHelper")
+                    ?? throw new InvalidOperationException("PipeHelper type not found");
+                Type lcfType = ipc.GetType("Microsoft.CodeCoverage.Interprocess.LoggerClientFactory")
+                    ?? throw new InvalidOperationException("LoggerClientFactory type not found");
+                Type lcfIfaceType = ipc.GetType("Microsoft.CodeCoverage.Interprocess.ILoggerClientFactory")
+                    ?? throw new InvalidOperationException("ILoggerClientFactory type not found");
+                Type loggerClientIfaceType = ipc.GetType("Microsoft.CodeCoverage.Interprocess.ILoggerClient")
+                    ?? throw new InvalidOperationException("ILoggerClient type not found");
+
+                object fileHelper = NewNonPublic(fileHelperType);
+                object runtimeInfoHelper = NewNonPublic(runtimeInfoHelperType);
+                environment = NewNonPublic(envType, fileHelper, runtimeInfoHelper);
+                NullLoggerInstance = NewNonPublic(nullLoggerType);
+                loggerClientFactory = NewNonPublic(lcfType, environment);
+
+                createLoggerClientMethod = lcfIfaceType.GetMethod("CreateLoggerClient")
+                    ?? throw new InvalidOperationException("CreateLoggerClient method not found");
+                sendSnapshotMethod = loggerClientIfaceType.GetMethod("SendSnapshotMessage")
+                    ?? throw new InvalidOperationException("SendSnapshotMessage method not found");
+
+                // Referenced only to confirm PipeHelper resolves; not otherwise needed
+                // here since LoggerClientFactory computes the pipe path itself.
+                _ = pipeHelperType;
+
+                Console.WriteLine($"Loaded Microsoft.CodeCoverage snapshot IPC path in-process from {corePath}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"Failed to load in-process snapshot IPC path ({ex.Message}); " +
+                    "snapshot operations will use the dotnet-coverage CLI subprocess instead (slower)");
+                initFailed = true;
+                return false;
+            }
+        }
+    }
+
+    private static object NewNonPublic(Type type, params object[] args)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        ConstructorInfo ctor = type.GetConstructors(flags).First(c => c.GetParameters().Length == args.Length)
+            ?? throw new InvalidOperationException($"No matching constructor found on {type.FullName}");
+        return ctor.Invoke(args);
+    }
+
+    /// Disposes all cached per-session LoggerClient connections. Call during
+    /// agent shutdown.
+    public static void DisposeAll()
+    {
+        foreach (var kvp in loggerClients)
+        {
+            (kvp.Value as IDisposable)?.Dispose();
+        }
+        loggerClients.Clear();
     }
 }
