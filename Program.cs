@@ -20,7 +20,19 @@
 //   On each /coverage request the agent takes a binary snapshot, converts it to
 //   Cobertura XML with `dotnet-coverage merge --output-format cobertura`, and
 //   returns the XML.  Snapshots are also accumulated for the final /report.
+//
+// Performance note:
+//   /coverage is called on every fuzzing iteration, so it is on the fuzzer's
+//   hot path. Folding each snapshot into `accumulated.coverage` requires an
+//   additional `dotnet-coverage merge` subprocess spawn, which is expensive
+//   (full CLR/JIT cold start). To keep that cost off the hot path, snapshots
+//   are handed to a single background worker thread that merges them
+//   sequentially; the HTTP response for /coverage is sent as soon as the
+//   (already unavoidable) snapshot + cobertura-conversion steps are done.
+//   /report drains this queue before building the final report so it never
+//   observes a stale accumulation.
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
@@ -43,6 +55,54 @@ if (!Regex.IsMatch(sessionId, @"^[a-zA-Z0-9_-]+$"))
 // --- Temp directory for accumulated coverage ---
 string tempDir = Path.Combine(Path.GetTempPath(), $"wuppiefuzz-dotnet-{sessionId}");
 Directory.CreateDirectory(tempDir);
+
+// --- Background accumulation worker ---
+// Snapshots are merged into accumulated.coverage off the /coverage hot path
+// (see performance note above). The queue is processed by a single thread so
+// merges never run concurrently against accumulated.coverage.
+var accumulateQueue = new BlockingCollection<string>();
+int pendingAccumulations = 0;
+var accumulatorThread = new Thread(() =>
+{
+    foreach (string snapFile in accumulateQueue.GetConsumingEnumerable())
+    {
+        try
+        {
+            AccumulateCoverage(snapFile, tempDir);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Warning: background accumulation failed: {ex.Message}");
+        }
+        finally
+        {
+            if (File.Exists(snapFile)) File.Delete(snapFile);
+            Interlocked.Decrement(ref pendingAccumulations);
+        }
+    }
+})
+{ IsBackground = true, Name = "wuppiefuzz-accumulator" };
+accumulatorThread.Start();
+
+// Hands a snapshot file off to the background worker. Ownership of the file
+// transfers to the worker, which deletes it once merged.
+void EnqueueAccumulate(string snapFile)
+{
+    Interlocked.Increment(ref pendingAccumulations);
+    accumulateQueue.Add(snapFile);
+}
+
+// Blocks (with a timeout) until all previously enqueued snapshots have been
+// merged into accumulated.coverage. Used before building a report so it
+// reflects the latest coverage rather than a stale accumulation.
+void WaitForAccumulationQueueDrained(int timeoutMs = 30_000)
+{
+    var sw = Stopwatch.StartNew();
+    while (Volatile.Read(ref pendingAccumulations) > 0 && sw.ElapsedMilliseconds < timeoutMs)
+        Thread.Sleep(20);
+    if (Volatile.Read(ref pendingAccumulations) > 0)
+        Console.Error.WriteLine("Warning: timed out waiting for background accumulation to drain");
+}
 
 // --- Start dotnet-coverage in server mode ---
 Console.WriteLine($"Starting dotnet-coverage collect --server-mode --session-id {sessionId}");
@@ -79,11 +139,14 @@ while (true)
         }
         else if (path == "/coverage")
         {
-            string xml = GetCoverageXml(sessionId, tempDir, reset);
+            string xml = GetCoverageXml(sessionId, tempDir, reset, EnqueueAccumulate);
             WriteText(res, 200, xml, "application/xml");
         }
         else if (path == "/report")
         {
+            // Ensure all queued snapshots are folded into accumulated.coverage
+            // before building the report, so it isn't missing recent hits.
+            WaitForAccumulationQueueDrained();
             byte[]? zip = GenerateReport(sessionId, tempDir);
             if (zip is not null)
             {
@@ -96,6 +159,7 @@ while (true)
             else
             {
                 // Fallback: reportgenerator not installed, return cobertura XML
+                // (queue already drained above)
                 string xml = GetAccumulatedCoberturaXml(tempDir);
                 WriteText(res, 200, xml, "application/xml");
             }
@@ -118,7 +182,10 @@ while (true)
     }
 }
 
-// --- Shutdown dotnet-coverage ---
+// --- Drain background accumulation, then shut down dotnet-coverage ---
+WaitForAccumulationQueueDrained();
+accumulateQueue.CompleteAdding();
+accumulatorThread.Join(5000);
 try { RunProcess("dotnet-coverage", $"shutdown {sessionId}"); } catch { }
 collectProc.WaitForExit(5000);
 Console.WriteLine("Agent stopped.");
@@ -128,12 +195,15 @@ Console.WriteLine("Agent stopped.");
 // ============================================================
 
 /// Snapshot current coverage, optionally reset, convert to cobertura XML.
-/// Also merges the snapshot into the running accumulated.coverage file.
-static string GetCoverageXml(string sessionId, string tempDir, bool reset)
+/// Hands the snapshot off to the background accumulation queue instead of
+/// merging it into accumulated.coverage synchronously, keeping the expensive
+/// `dotnet-coverage merge` call off the fuzzer's hot path.
+static string GetCoverageXml(string sessionId, string tempDir, bool reset, Action<string> enqueueAccumulate)
 {
     string guid = Guid.NewGuid().ToString("N");
     string snapFile = Path.Combine(tempDir, $"snap-{guid}.coverage");
     string xmlFile = Path.Combine(tempDir, $"snap-{guid}.xml");
+    bool handedOff = false;
     try
     {
         string resetFlag = reset ? "--reset" : "";
@@ -150,14 +220,16 @@ static string GetCoverageXml(string sessionId, string tempDir, bool reset)
             ? File.ReadAllText(xmlFile)
             : "<coverage version=\"1\"><packages/></coverage>";
 
-        // Merge snapshot into the running accumulated coverage (used for /report)
-        AccumulateCoverage(snapFile, tempDir);
+        // Hand snapshot off to the background worker; it deletes the file
+        // once merged into accumulated.coverage (used for /report).
+        enqueueAccumulate(snapFile);
+        handedOff = true;
 
         return xml;
     }
     finally
     {
-        if (File.Exists(snapFile)) File.Delete(snapFile);
+        if (!handedOff && File.Exists(snapFile)) File.Delete(snapFile);
         if (File.Exists(xmlFile)) File.Delete(xmlFile);
     }
 }
