@@ -18,24 +18,35 @@
 //   is started with `dotnet-coverage connect <session-id> <app-command>`, which
 //   attaches coverage collection via named pipes (no source changes required).
 //   On each /coverage request the agent takes a binary snapshot, converts it to
-//   Cobertura XML with `dotnet-coverage merge --output-format cobertura`, and
-//   returns the XML.  Snapshots are also accumulated for the final /report.
+//   Cobertura XML, and returns the XML.  Snapshots are also accumulated for the
+//   final /report.
 //
-// Performance note:
+// Performance notes:
 //   /coverage is called on every fuzzing iteration, so it is on the fuzzer's
-//   hot path. Folding each snapshot into `accumulated.coverage` requires an
-//   additional `dotnet-coverage merge` subprocess spawn, which is expensive
-//   (full CLR/JIT cold start). To keep that cost off the hot path, snapshots
-//   are handed to a single background worker thread that merges them
-//   sequentially; the HTTP response for /coverage is sent as soon as the
-//   (already unavoidable) snapshot + cobertura-conversion steps are done.
-//   /report drains this queue before building the final report so it never
-//   observes a stale accumulation.
+//   hot path.
+//   - Folding each snapshot into `accumulated.coverage` is deferred to a
+//     single background worker thread instead of running synchronously on
+//     every /coverage call; the HTTP response is sent as soon as the
+//     snapshot + cobertura-conversion steps are done. /report drains this
+//     queue before building the final report so it never observes a stale
+//     accumulation.
+//   - Binary-to-Cobertura/binary-to-binary conversion ("merge") uses
+//     Microsoft.CodeCoverage.Core's CoverageFileUtilityV2 API in-process
+//     (see CoverageMerger below) instead of spawning `dotnet-coverage merge`
+//     as a subprocess: that CLI command re-builds a large dependency
+//     injection graph, sets up file logging, and parses command-line
+//     arguments on every invocation, which is measurably much slower than
+//     calling the underlying conversion routine directly. `snapshot` still
+//     has to go through the CLI, since triggering it requires an internal,
+//     non-public IPC client to talk to the running
+//     `dotnet-coverage collect --server-mode` process.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
+using System.Reflection;
+using System.Runtime.Loader;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -215,7 +226,8 @@ static string GetCoverageXml(string sessionId, string tempDir, bool reset, Actio
         }
 
         // Convert binary .coverage -> cobertura XML for the Rust client
-        RunProcess("dotnet-coverage", $"merge \"{snapFile}\" -f cobertura -o \"{xmlFile}\"");
+        if (!CoverageMerger.TryMerge(xmlFile, new[] { snapFile }, MergeKind.Cobertura))
+            RunProcess("dotnet-coverage", $"merge \"{snapFile}\" -f cobertura -o \"{xmlFile}\"");
         string xml = File.Exists(xmlFile)
             ? File.ReadAllText(xmlFile)
             : "<coverage version=\"1\"><packages/></coverage>";
@@ -247,10 +259,14 @@ static void AccumulateCoverage(string snapFile, string tempDir)
         }
         else
         {
-            int rc = RunProcess("dotnet-coverage",
-                $"merge \"{accFile}\" \"{snapFile}\" -f coverage -o \"{tmpAcc}\"");
-            if (rc == 0 && File.Exists(tmpAcc))
-                File.Move(tmpAcc, accFile, overwrite: true);
+            bool merged = CoverageMerger.TryMerge(tmpAcc, new[] { accFile, snapFile }, MergeKind.Coverage);
+            if (!merged)
+            {
+                int rc = RunProcess("dotnet-coverage",
+                    $"merge \"{accFile}\" \"{snapFile}\" -f coverage -o \"{tmpAcc}\"");
+                merged = rc == 0 && File.Exists(tmpAcc);
+            }
+            if (merged) File.Move(tmpAcc, accFile, overwrite: true);
         }
     }
     catch (Exception ex)
@@ -271,7 +287,8 @@ static string GetAccumulatedCoberturaXml(string tempDir)
         return "<coverage version=\"1\"><packages/></coverage>";
 
     string xmlFile = Path.Combine(tempDir, "accumulated.cobertura.xml");
-    RunProcess("dotnet-coverage", $"merge \"{accFile}\" -f cobertura -o \"{xmlFile}\"");
+    if (!CoverageMerger.TryMerge(xmlFile, new[] { accFile }, MergeKind.Cobertura))
+        RunProcess("dotnet-coverage", $"merge \"{accFile}\" -f cobertura -o \"{xmlFile}\"");
     if (!File.Exists(xmlFile))
         return "<coverage version=\"1\"><packages/></coverage>";
     string xml = File.ReadAllText(xmlFile);
@@ -301,8 +318,13 @@ static byte[]? GenerateReport(string sessionId, string tempDir)
         }
 
         // Convert accumulated binary coverage to cobertura
-        int rc = RunProcess("dotnet-coverage", $"merge \"{accFile}\" -f cobertura -o \"{xmlFile}\"");
-        if (rc != 0 || !File.Exists(xmlFile)) return null;
+        bool merged = CoverageMerger.TryMerge(xmlFile, new[] { accFile }, MergeKind.Cobertura);
+        if (!merged)
+        {
+            int rc = RunProcess("dotnet-coverage", $"merge \"{accFile}\" -f cobertura -o \"{xmlFile}\"");
+            merged = rc == 0 && File.Exists(xmlFile);
+        }
+        if (!merged) return null;
 
         // Run reportgenerator to produce HTML
         if (Directory.Exists(reportDir)) Directory.Delete(reportDir, true);
@@ -369,4 +391,154 @@ static int RunProcess(string fileName, string arguments)
     proc.Start();
     proc.WaitForExit(60_000);
     return proc.ExitCode;
+}
+
+/// Merges coverage files in-process using Microsoft.CodeCoverage.Core's
+/// public CoverageFileUtilityV2 API instead of spawning `dotnet-coverage
+/// merge` as a subprocess.
+///
+/// Rationale: the `dotnet-coverage merge` CLI command re-builds a large
+/// dependency injection graph, configures file logging, and parses
+/// command-line arguments on every invocation before doing the (comparatively
+/// tiny) actual merge/conversion work. Calling the underlying conversion
+/// routine directly skips all of that fixed overhead. This routine is public
+/// API surface (has XML doc comments) shipped inside the officially
+/// published `Microsoft.CodeCoverage` NuGet package
+/// (`build/netstandard2.0/Microsoft.CodeCoverage.Core.dll`), but it is not
+/// exposed via a `lib/` reference and has no formal support/versioning
+/// contract for external callers, so every step here is defensive: if the
+/// assembly can't be found, doesn't expose the expected members, or throws,
+/// callers fall back to spawning `dotnet-coverage merge` as a subprocess
+/// (slower, but always correct).
+///
+/// We locate the DLL inside the already-required `dotnet-coverage` global
+/// tool's install directory rather than adding a NuGet package reference:
+/// that directory already contains a mutually-compatible, self-contained
+/// set of the library and its dependencies (Mono.Cecil, etc.), avoiding any
+/// version-mismatch risk between a separately-restored package and the
+/// installed CLI tool version.
+static class CoverageMerger
+{
+    private static readonly object InitLock = new();
+    private static object? utility;
+    private static MethodInfo? mergeMethod;
+    private static Type? mergeOperationEnumType;
+    private static bool initFailed;
+
+    /// Attempts an in-process merge/conversion. Returns true if the output
+    /// file was written successfully; false if in-process invocation is
+    /// unavailable or failed (caller should fall back to the CLI subprocess).
+    public static bool TryMerge(string outputPath, string[] inputFiles, MergeKind kind)
+    {
+        if (!EnsureInitialized()) return false;
+        try
+        {
+            string operationName = kind switch
+            {
+                MergeKind.Cobertura => "MergeToCobertura",
+                MergeKind.Coverage => "MergeToCoverage",
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+            object mergeOperation = Enum.Parse(mergeOperationEnumType!, operationName);
+            var task = (Task<string[]>)mergeMethod!.Invoke(
+                utility, new object[] { outputPath, inputFiles, mergeOperation, CancellationToken.None })!;
+            task.GetAwaiter().GetResult();
+            return File.Exists(outputPath);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"In-process coverage merge failed ({ex.Message}); falling back to subprocess for this call");
+            return false;
+        }
+    }
+
+    private static bool EnsureInitialized()
+    {
+        if (utility is not null) return true;
+        if (initFailed) return false;
+        lock (InitLock)
+        {
+            if (utility is not null) return true;
+            if (initFailed) return false;
+            try
+            {
+                string? dllPath = FindCoreDll();
+                if (dllPath is null)
+                {
+                    Console.Error.WriteLine(
+                        "Microsoft.CodeCoverage.Core.dll not found; merge operations will use " +
+                        "the dotnet-coverage CLI subprocess instead (slower)");
+                    initFailed = true;
+                    return false;
+                }
+
+                var loadContext = new IsolatedCoverageCoreLoadContext(dllPath);
+                Assembly asm = loadContext.LoadFromAssemblyPath(dllPath);
+                Type utilType = asm.GetType("Microsoft.CodeCoverage.Core.CoverageFileUtilityV2")
+                    ?? throw new InvalidOperationException("CoverageFileUtilityV2 type not found");
+                Type cfgType = asm.GetType("Microsoft.CodeCoverage.Core.CoverageFileConfiguration")
+                    ?? throw new InvalidOperationException("CoverageFileConfiguration type not found");
+                mergeOperationEnumType = asm.GetType("Microsoft.CodeCoverage.Core.CoverageMergeOperation")
+                    ?? throw new InvalidOperationException("CoverageMergeOperation type not found");
+
+                object cfg = Activator.CreateInstance(cfgType)!;
+                utility = Activator.CreateInstance(utilType, cfg)!;
+                mergeMethod = utilType.GetMethod("MergeCoverageFilesAsync")
+                    ?? throw new InvalidOperationException("MergeCoverageFilesAsync method not found");
+
+                Console.WriteLine($"Loaded Microsoft.CodeCoverage.Core in-process from {dllPath}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"Failed to load Microsoft.CodeCoverage.Core in-process ({ex.Message}); " +
+                    "merge operations will use the dotnet-coverage CLI subprocess instead (slower)");
+                initFailed = true;
+                return false;
+            }
+        }
+    }
+
+    /// Locates Microsoft.CodeCoverage.Core.dll inside the currently
+    /// installed `dotnet-coverage` global tool's store directory:
+    /// ~/.dotnet/tools/.store/dotnet-coverage/&lt;version&gt;/dotnet-coverage/&lt;version&gt;/tools/&lt;tfm&gt;/any/Microsoft.CodeCoverage.Core.dll
+    private static string? FindCoreDll()
+    {
+        string toolsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools");
+        string storeDir = Path.Combine(toolsDir, ".store", "dotnet-coverage");
+        if (!Directory.Exists(storeDir)) return null;
+
+        return Directory.GetFiles(storeDir, "Microsoft.CodeCoverage.Core.dll", SearchOption.AllDirectories)
+            .OrderByDescending(f => f) // prefer the lexicographically-highest (newest) version path
+            .FirstOrDefault();
+    }
+}
+
+enum MergeKind
+{
+    Cobertura,
+    Coverage,
+}
+
+/// Isolated load context for Microsoft.CodeCoverage.Core.dll and its
+/// dependencies (Mono.Cecil, etc.), resolving them from the tool's own
+/// install directory so they can't collide with this agent's own
+/// dependencies.
+sealed class IsolatedCoverageCoreLoadContext : AssemblyLoadContext
+{
+    private readonly string baseDir;
+
+    public IsolatedCoverageCoreLoadContext(string mainDllPath) : base("coverage-core-inproc", isCollectible: false)
+    {
+        baseDir = Path.GetDirectoryName(mainDllPath)!;
+    }
+
+    protected override Assembly? Load(AssemblyName assemblyName)
+    {
+        string candidate = Path.Combine(baseDir, assemblyName.Name + ".dll");
+        return File.Exists(candidate) ? LoadFromAssemblyPath(candidate) : null;
+    }
 }
