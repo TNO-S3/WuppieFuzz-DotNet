@@ -106,7 +106,7 @@ In your WuppieFuzz configuration (YAML file or CLI), specify the dotnet coverage
 ### CLI:
 ```bash
 wuppiefuzz fuzz \
-  --coverage-format dotnet \
+  --coverage-format cobertura \
   --coverage-host 127.0.0.1:6302 \
   api_spec.yaml
 ```
@@ -125,7 +125,7 @@ To only collect coverage from specific namespaces or file paths, use the `dotnet
 #### CLI:
 ```bash
 wuppiefuzz fuzz \
-  --coverage-format dotnet \
+  --coverage-format cobertura \
   --coverage-host 127.0.0.1:6302 \
   --dotnet-namespace-filter "MyApp.Controllers" \
   api_spec.yaml
@@ -255,7 +255,7 @@ dotnet-coverage connect fuzzing-session dotnet run
 ```bash
 cd /path/to/wuppiefuzz
 wuppiefuzz fuzz \
-  --coverage-format dotnet \
+  --coverage-format cobertura \
   --coverage-host 127.0.0.1:6302 \
   --report=true \
   --timeout 3600 \

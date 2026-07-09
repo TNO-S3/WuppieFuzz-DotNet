@@ -1,3 +1,26 @@
+// WuppieFuzz .NET Coverage Agent
+//
+// This is the .NET-specific implementation of the WuppieFuzz Cobertura-over-HTTP
+// coverage protocol.  The same HTTP contract can be implemented by agents for
+// other languages; the Rust client (src/coverage_clients/cobertura.rs) is
+// language-agnostic.
+//
+// Protocol (used by CoberturaCoverageClient):
+//   GET /coverage[?reset=true]  → Cobertura XML snapshot of current coverage
+//   GET /report                 → HTML report as a ZIP archive (optional endpoint;
+//                                  falls back to raw Cobertura XML if reportgenerator
+//                                  is not installed)
+//   GET /health                 → "OK"
+//   GET /shutdown               → graceful shutdown
+//
+// .NET-specific implementation detail:
+//   This agent wraps Microsoft's `dotnet-coverage` tool.  The target application
+//   is started with `dotnet-coverage connect <session-id> <app-command>`, which
+//   attaches coverage collection via named pipes (no source changes required).
+//   On each /coverage request the agent takes a binary snapshot, converts it to
+//   Cobertura XML with `dotnet-coverage merge --output-format cobertura`, and
+//   returns the XML.  Snapshots are also accumulated for the final /report.
+
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
