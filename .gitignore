@@ -18,3 +18,4 @@ obj/
 # Rider
 .idea/
 *.sln.iml
+*.coverage
