@@ -57,10 +57,12 @@
 //     non-public IPC client to talk to the running
 //     `dotnet-coverage collect --server-mode` process.
 
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text;
@@ -138,6 +140,21 @@ Process collectProc = StartBackground("dotnet-coverage", $"collect --server-mode
 // Give the dotnet-coverage server time to initialise its named-pipe listener
 Thread.Sleep(2000);
 
+// --- Raw TCP fast-path server ---
+// A minimal, persistent-connection binary protocol used only for the hot
+// /coverage path (see RawCoverageServerLoop below for the wire format and
+// rationale). This runs alongside the HTTP server so /health, /report and
+// /shutdown are unaffected; only the Rust client's steady-state coverage
+// polling uses this path, and it transparently falls back to HTTP if this
+// port is unreachable (e.g. an older client, or a firewall in between).
+int rawPort = port + 1;
+var rawListener = new TcpListener(IPAddress.Any, rawPort);
+rawListener.Start();
+var rawThread = new Thread(() => RawCoverageServerLoop(rawListener, sessionId, tempDir, EnqueueAccumulate))
+{ IsBackground = true, Name = "wuppiefuzz-raw-coverage" };
+rawThread.Start();
+Console.WriteLine($"WuppieFuzz .NET coverage agent raw fast-path listening on port {rawPort}");
+
 // --- HTTP server ---
 var listener = new HttpListener();
 // Use http://+:{port}/ so the agent can be reached from other machines
@@ -213,6 +230,7 @@ while (true)
 }
 
 // --- Drain background accumulation, then shut down dotnet-coverage ---
+try { rawListener.Stop(); } catch { }
 WaitForAccumulationQueueDrained();
 accumulateQueue.CompleteAdding();
 accumulatorThread.Join(5000);
@@ -224,6 +242,85 @@ Console.WriteLine("Agent stopped.");
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Accepts connections on `rawListener` and serves the raw fast-path
+/// coverage protocol on each of them, one connection at a time (the Rust
+/// client only ever opens one). Wire format, per request on the connection:
+///
+///   client -> server: 1 byte,  0x00 = fetch, 0x01 = fetch-and-reset
+///   server -> client: 4 bytes little-endian length prefix, followed by
+///                     that many bytes of UTF-8 payload in the same
+///                     tab-separated wire format used by the HTTP fast path
+///                     (see <see cref="CoverageReportReader"/>).
+///
+/// The entire response (length prefix + payload) is written with a single
+/// `Write` call. This -- combined with keeping one TCP connection open for
+/// the whole run instead of reconnecting every request -- is the whole
+/// point of this endpoint: avoids both the Nagle/delayed-ACK stall that a
+/// framework doing separate header/body writes can hit on a reused HTTP
+/// keep-alive connection, and the handshake/socket-teardown cost of
+/// reconnecting for every single request (which the HTTP client currently
+/// pays to avoid that stall). See cobertura_raw.rs on the Rust side for the
+/// corresponding client and more detail on the motivation.
+///
+/// Any I/O error simply drops the connection and goes back to accepting a
+/// new one; the Rust client falls back to HTTP if it can't use this port at
+/// all (e.g. blocked by a firewall, or an older agent that doesn't open it).
+static void RawCoverageServerLoop(TcpListener rawListener, string sessionId, string tempDir, Action<string> enqueueAccumulate)
+{
+    while (true)
+    {
+        TcpClient client;
+        try { client = rawListener.AcceptTcpClient(); }
+        catch (SocketException) { break; }
+        catch (ObjectDisposedException) { break; }
+
+        try
+        {
+            client.NoDelay = true;
+            using NetworkStream stream = client.GetStream();
+            byte[] requestByte = new byte[1];
+            while (ReadExact(stream, requestByte, 1))
+            {
+                bool reset = requestByte[0] != 0;
+                CoverageFetchResult coverage = GetCoverage(sessionId, tempDir, reset, enqueueAccumulate);
+                byte[] payload = Encoding.UTF8.GetBytes(coverage.Body);
+                byte[] frame = new byte[4 + payload.Length];
+                BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length);
+                Buffer.BlockCopy(payload, 0, frame, 4, payload.Length);
+                stream.Write(frame, 0, frame.Length);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Raw coverage connection error: {ex.Message}");
+        }
+        finally
+        {
+            client.Dispose();
+        }
+    }
+}
+
+/// Reads exactly `count` bytes into `buffer`, looping over partial reads.
+/// Returns false on a clean EOF before any bytes were read (i.e. the peer
+/// closed the connection between requests); throws on a partial-then-EOF
+/// read, which indicates a broken connection mid-message.
+static bool ReadExact(NetworkStream stream, byte[] buffer, int count)
+{
+    int offset = 0;
+    while (offset < count)
+    {
+        int read = stream.Read(buffer, offset, count - offset);
+        if (read == 0)
+        {
+            if (offset == 0) return false;
+            throw new IOException("Connection closed mid-message");
+        }
+        offset += read;
+    }
+    return true;
+}
 
 /// Snapshot current coverage, optionally reset, and produce the response
 /// body for /coverage. Hands the snapshot off to the background
@@ -897,3 +994,4 @@ static class SnapshotClient
         loggerClients.Clear();
     }
 }
+
